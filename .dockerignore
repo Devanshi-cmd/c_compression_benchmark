@@ -1,0 +1,13 @@
+# Exclude heavy runtime artifacts from build context
+data/repos/
+data/encoded.dat
+checkpoints/
+results/
+*.log
+*.pyc
+__pycache__/
+.git/
+.gitignore
+*.pt
+*.npy
+.DS_Store
