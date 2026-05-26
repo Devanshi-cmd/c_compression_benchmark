@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+data/repos/
+data/encoded.dat
+data/vocab.json
+data/metadata.json
+checkpoints/
+results/
+*.log
+*.pt
+*.npy
+.DS_Store
