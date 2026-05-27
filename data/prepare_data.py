@@ -284,6 +284,19 @@ def main():
     print(f"  Val chars           : {val_end - train_end:,} ({(val_end-train_end)/actual_chars*100:.1f}%)")
     print("=" * 60)
 
+    # ---- Upload to R2 ----
+    print()
+    print("Uploading training data to R2...")
+    try:
+        sys.path.insert(0, str(SCRIPT_DIR.parent))
+        from r2_storage import upload_training_data
+        upload_training_data(str(SCRIPT_DIR))
+        print("R2 upload complete.")
+    except Exception as e:
+        print(f"WARNING: R2 upload failed: {e}")
+        print("Training data is available locally. Upload manually with:")
+        print("  python r2_storage.py upload-data")
+
 
 if __name__ == '__main__':
     main()

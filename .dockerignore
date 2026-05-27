@@ -1,4 +1,5 @@
-# Exclude heavy runtime artifacts from build context
+# Exclude heavy runtime artifacts and secrets from build context
+.env
 data/repos/
 data/encoded.dat
 checkpoints/

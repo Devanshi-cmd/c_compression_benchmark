@@ -10,9 +10,11 @@ Usage:
 Features:
   - AdamW optimizer, cosine LR schedule with linear warmup
   - Mixed precision training (bfloat16 activations, float32 weights)
-  - Resumable from latest checkpoint (Ctrl-C safe)
+  - Resumable from latest checkpoint (Ctrl-C safe + R2 restore)
   - Epoch-level logging to JSON and training.log
   - RTX 5090 optimizations: torch.compile, pin_memory, non_blocking transfers
+  - R2: downloads training data at start, uploads checkpoints after each epoch
+  - Auto-shutdown after all epochs complete (exit 0 for Salad restart=on-failure)
 """
 
 import argparse
@@ -24,6 +26,13 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
+
+# Load .env before anything else
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / '.env')
+except ImportError:
+    pass
 
 import numpy as np
 import torch
@@ -56,6 +65,61 @@ WEIGHT_DECAY  = 0.1
 GRAD_CLIP     = 1.0
 WARMUP_STEPS  = 500
 VAL_FRAC      = 0.05          # fraction of chunk used for validation each epoch
+
+
+# ---------------------------------------------------------------------------
+# R2 integration
+# ---------------------------------------------------------------------------
+
+def r2_available() -> bool:
+    return bool(os.environ.get('R2_ACCESS_KEY_ID') and os.environ.get('R2_BUCKET'))
+
+
+def fetch_training_data_from_r2():
+    """Download encoded.dat, vocab.json, metadata.json from R2 if not local."""
+    if not r2_available():
+        print("[R2] Credentials not set — skipping data download.")
+        return
+    if (ENCODED_DAT.exists() and VOCAB_JSON.exists() and METADATA_JSON.exists()):
+        print("[R2] Training data already present locally.")
+        return
+    print("[R2] Fetching training data from R2...")
+    try:
+        from r2_storage import download_training_data
+        ok = download_training_data(str(DATA_DIR))
+        if not ok:
+            print("[R2] WARNING: Some training data files missing from R2.")
+    except Exception as e:
+        print(f"[R2] Data fetch failed: {e}")
+
+
+def fetch_checkpoint_from_r2(model_id: int, ckpt_dir: Path):
+    """Download latest checkpoint from R2 if not present locally."""
+    if not r2_available():
+        return
+    for name in ['latest.pt', 'best_model.pt']:
+        local = ckpt_dir / name
+        if local.exists():
+            continue
+        print(f"[R2] Fetching checkpoint model{model_id}/{name}...")
+        try:
+            from r2_storage import download_checkpoint
+            download_checkpoint(model_id, name, str(local))
+        except Exception as e:
+            print(f"[R2] Checkpoint fetch failed: {e}")
+
+
+def push_checkpoint_to_r2(model_id: int, ckpt_path: Path, is_best: bool):
+    """Upload checkpoint to R2 after each epoch."""
+    if not r2_available():
+        return
+    try:
+        from r2_storage import upload_checkpoint
+        upload_checkpoint(str(ckpt_path), model_id, 'latest.pt')
+        if is_best:
+            upload_checkpoint(str(ckpt_path), model_id, 'best_model.pt')
+    except Exception as e:
+        print(f"[R2] Checkpoint upload failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -265,13 +329,16 @@ def train_model(model_id: int):
     print(f"Training Model {model_id}")
     print(f"{'='*60}")
 
+    # ---- Step 0: pull training data from R2 if not local ----
+    fetch_training_data_from_r2()
+
     # Load metadata
     if not METADATA_JSON.exists():
         print(f"ERROR: {METADATA_JSON} not found. Run data/prepare_data.py first.")
         sys.exit(1)
     with open(METADATA_JSON) as f:
         metadata = json.load(f)
-    vocab_size = metadata['vocab_size']
+    vocab_size  = metadata['vocab_size']
     total_chars = metadata['total_chars']
 
     print(f"Vocab size  : {vocab_size}")
@@ -304,38 +371,46 @@ def train_model(model_id: int):
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=LR, betas=BETAS, weight_decay=WEIGHT_DECAY,
-        fused=(device.type == 'cuda' and torch.__version__ >= '2.0')  # fused AdamW for RTX 5090
+        fused=(device.type == 'cuda' and torch.__version__ >= '2.0')
     )
 
     # GradScaler for mixed precision
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
 
     # Checkpoint dir
-    ckpt_dir = get_checkpoint_dir(model_id)
+    ckpt_dir   = get_checkpoint_dir(model_id)
     stats_path = RESULTS_DIR / f'training_stats_model{model_id}.json'
     log_path   = PROJECT_ROOT / f'training_model{model_id}.log'
 
-    # Resume
+    # ---- Step 1: pull latest checkpoint from R2 if not local ----
+    fetch_checkpoint_from_r2(model_id, ckpt_dir)
+
+    # Resume from local checkpoint
     start_epoch, best_val_loss, all_stats = load_checkpoint(
         ckpt_dir, model, optimizer, None, device)
+
+    # If already finished all epochs, skip
+    if start_epoch >= EPOCHS:
+        print(f"[Model {model_id}] Already completed {EPOCHS} epochs. Nothing to do.")
+        return all_stats
 
     # Estimate total steps
     samples_per_chunk = min(CHUNK_SIZE, metadata['train_end']) - CONTEXT_LEN
     steps_per_epoch   = max(1, samples_per_chunk // BATCH_SIZE)
     total_steps       = EPOCHS * steps_per_epoch
     global_step       = start_epoch * steps_per_epoch
+    print(f"Epochs      : {start_epoch} → {EPOCHS} (resuming)")
     print(f"Est steps/epoch : {steps_per_epoch:,}")
     print(f"Est total steps : {total_steps:,}")
 
-    # Ctrl-C handler
+    # Ctrl-C / SIGTERM handler
     interrupted = [False]
     def handle_interrupt(sig, frame):
         print("\n[Interrupt] Saving checkpoint before exit...")
         interrupted[0] = True
-    signal.signal(signal.SIGINT, handle_interrupt)
+    signal.signal(signal.SIGINT,  handle_interrupt)
     signal.signal(signal.SIGTERM, handle_interrupt)
 
-    # Open log file
     log_file = open(log_path, 'a')
 
     def log(msg):
@@ -343,34 +418,31 @@ def train_model(model_id: int):
         print(msg, file=log_file, flush=True)
 
     log(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Training Model {model_id} "
-        f"starting at epoch {start_epoch}")
+        f"starting at epoch {start_epoch + 1}/{EPOCHS}")
 
+    epoch = start_epoch  # ensure defined for finally block
     try:
         for epoch in range(start_epoch, EPOCHS):
             if interrupted[0]:
                 break
 
-            epoch_t0 = time.time()
-            chunk_offset = epoch * CHUNK_SIZE  # rotate through corpus
+            epoch_t0     = time.time()
+            chunk_offset = epoch * CHUNK_SIZE
 
             log(f"\n--- Epoch {epoch+1}/{EPOCHS} ---")
 
-            # Dataloaders
             num_workers = min(4, os.cpu_count() or 1)
             train_loader, val_loader, chunk_start = make_dataloaders(
                 metadata, chunk_offset, BATCH_SIZE, num_workers)
             log(f"  Chunk offset: {chunk_start:,} chars")
             log(f"  Train batches: {len(train_loader):,} | Val batches: {len(val_loader):,}")
 
-            # Train
             train_loss, global_step = train_epoch(
                 model, train_loader, optimizer, scaler, device,
                 global_step, total_steps
             )
 
-            # Eval
-            val_loss = eval_epoch(model, val_loader, device)
-
+            val_loss   = eval_epoch(model, val_loader, device)
             epoch_time = time.time() - epoch_t0
             bpc_train  = train_loss / math.log(2)
             bpc_val    = val_loss   / math.log(2)
@@ -380,69 +452,78 @@ def train_model(model_id: int):
             if is_best:
                 best_val_loss = val_loss
 
-            # Log
+            # ETA
+            epochs_left  = EPOCHS - (epoch + 1)
+            eta_seconds  = epochs_left * epoch_time
+            eta_str      = f"{eta_seconds/3600:.1f}h" if eta_seconds > 3600 else f"{eta_seconds/60:.0f}m"
+
             epoch_stat = {
-                'epoch':       epoch + 1,
-                'train_loss':  round(train_loss, 6),
-                'val_loss':    round(val_loss,   6),
-                'bpc_train':   round(bpc_train,  6),
-                'bpc_val':     round(bpc_val,    6),
-                'lr':          round(current_lr, 8),
+                'epoch':        epoch + 1,
+                'train_loss':   round(train_loss, 6),
+                'val_loss':     round(val_loss,   6),
+                'bpc_train':    round(bpc_train,  6),
+                'bpc_val':      round(bpc_val,    6),
+                'lr':           round(current_lr, 8),
                 'epoch_time_s': round(epoch_time, 2),
-                'is_best':     is_best,
-                'global_step': global_step,
+                'is_best':      is_best,
+                'global_step':  global_step,
+                'eta':          eta_str,
             }
             all_stats.append(epoch_stat)
 
             log(f"  train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
                 f"bpc_val={bpc_val:.4f} | lr={current_lr:.2e} | "
-                f"time={epoch_time:.0f}s {'[BEST]' if is_best else ''}")
+                f"time={epoch_time:.0f}s | ETA {eta_str} "
+                f"{'[BEST]' if is_best else ''}")
 
-            # Save stats
+            # Save stats locally
             with open(stats_path, 'w') as f:
                 json.dump(all_stats, f, indent=2)
 
-            # Save checkpoint
+            # Save checkpoint locally
             state = {
-                'epoch':               epoch,
-                'model_state_dict':    model.state_dict(),
+                'epoch':                epoch,
+                'model_state_dict':     model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'best_val_loss':       best_val_loss,
-                'train_stats':         all_stats,
-                'vocab_size':          vocab_size,
-                'model_id':            model_id,
+                'best_val_loss':        best_val_loss,
+                'train_stats':          all_stats,
+                'vocab_size':           vocab_size,
+                'model_id':             model_id,
             }
             ckpt_path = save_checkpoint(state, ckpt_dir, epoch + 1, is_best)
-            log(f"  Checkpoint: {ckpt_path.name}")
+            log(f"  Checkpoint saved: {ckpt_path.name}")
+
+            # ---- Upload checkpoint to R2 ----
+            push_checkpoint_to_r2(model_id, ckpt_path, is_best)
 
     except KeyboardInterrupt:
         log("\n[KeyboardInterrupt] Saving emergency checkpoint...")
         interrupted[0] = True
 
     finally:
-        if interrupted[0] or True:
-            # Always save final state
-            try:
-                state = {
-                    'epoch':               epoch if 'epoch' in dir() else start_epoch,
-                    'model_state_dict':    model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'best_val_loss':       best_val_loss,
-                    'train_stats':         all_stats,
-                    'vocab_size':          vocab_size,
-                    'model_id':            model_id,
-                }
-                emergency_path = ckpt_dir / 'emergency_checkpoint.pt'
-                torch.save(state, emergency_path)
-                log(f"Emergency checkpoint saved: {emergency_path}")
-            except Exception as e:
-                log(f"Emergency save failed: {e}")
+        # Always save + push on exit (interrupt or normal)
+        try:
+            state = {
+                'epoch':                epoch,
+                'model_state_dict':     model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_val_loss':        best_val_loss,
+                'train_stats':          all_stats,
+                'vocab_size':           vocab_size,
+                'model_id':             model_id,
+            }
+            emergency_path = ckpt_dir / 'emergency_checkpoint.pt'
+            torch.save(state, emergency_path)
+            log(f"Emergency checkpoint saved: {emergency_path}")
+            push_checkpoint_to_r2(model_id, emergency_path, False)
+        except Exception as e:
+            log(f"Emergency save failed: {e}")
 
         log_file.close()
 
     log(f"\nTraining Model {model_id} complete.")
-    log(f"Best validation loss: {best_val_loss:.4f} ({best_val_loss/math.log(2):.4f} bpc)")
-    log(f"Stats saved to: {stats_path}")
+    log(f"Best val loss : {best_val_loss:.4f} ({best_val_loss/math.log(2):.4f} bpc)")
+    log(f"Stats saved   : {stats_path}")
 
     return all_stats
 
