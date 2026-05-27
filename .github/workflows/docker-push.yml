@@ -28,6 +28,8 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          tags: devanshitiwari04/c_compression_benchmark:latest
+          tags: |
+            devanshitiwari04/c_compression_benchmark:latest
+            devanshitiwari04/c_compression_benchmark:v1
           cache-from: type=gha
           cache-to: type=gha,mode=max
