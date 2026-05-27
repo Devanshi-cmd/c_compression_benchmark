@@ -51,8 +51,6 @@ def _get_client():
         region_name='auto',
         config=Config(
             retries={'max_attempts': 5, 'mode': 'adaptive'},
-            multipart_threshold=64 * 1024 * 1024,      # 64 MB
-            multipart_chunksize=64 * 1024 * 1024,       # 64 MB chunks
             max_pool_connections=10,
         )
     )
