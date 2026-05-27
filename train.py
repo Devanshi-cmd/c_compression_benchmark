@@ -57,7 +57,7 @@ RESULTS_DIR.mkdir(exist_ok=True)
 # ---------------------------------------------------------------------------
 CONTEXT_LEN   = 128
 BATCH_SIZE    = 512
-EPOCHS        = 20
+EPOCHS        = int(os.environ.get('EPOCHS', 20))
 CHUNK_SIZE    = 250_000_000   # chars per epoch chunk
 LR            = 3e-4
 BETAS         = (0.9, 0.95)
