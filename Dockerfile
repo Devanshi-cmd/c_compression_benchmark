@@ -1,12 +1,9 @@
 # Dockerfile — BitNet C Compression Benchmark
-# Base: CUDA 12.4 + Ubuntu 22.04
-# Optimized for RTX 5090 (Ada Lovelace, compute capability 10.0)
+# Base: CUDA 12.8 + Ubuntu 22.04
+# RTX 5090 (Blackwell, sm_120) requires PyTorch 2.6+ with CUDA 12.6+
 # Salad platform compatible: no TTY, auto-resume on spot interruption
-#
-# Build for Salad (linux/amd64) from Mac ARM:
-#   docker buildx build --platform linux/amd64 -t <repo>/c_compression_benchmark:latest --push .
 
-FROM --platform=linux/amd64 nvidia/cuda:12.4.1-runtime-ubuntu22.04
+FROM --platform=linux/amd64 nvidia/cuda:12.8.1-runtime-ubuntu22.04
 
 # ── System packages ───────────────────────────────────────────────────────────
 ENV DEBIAN_FRONTEND=noninteractive
@@ -30,11 +27,11 @@ RUN update-alternatives --install /usr/bin/python  python  /usr/bin/python3.11 1
 # Upgrade pip
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# ── PyTorch (CUDA 12.4) ───────────────────────────────────────────────────────
-# Pin torch version for reproducibility
+# ── PyTorch (CUDA 12.8) ───────────────────────────────────────────────────────
+# PyTorch 2.6+ required for RTX 5090 (Blackwell sm_120) support
 RUN pip install --no-cache-dir \
-    torch==2.4.0 \
-    --index-url https://download.pytorch.org/whl/cu124
+    torch==2.6.0 \
+    --index-url https://download.pytorch.org/whl/cu126
 
 # ── Project dependencies ──────────────────────────────────────────────────────
 COPY requirements.txt /tmp/requirements.txt
