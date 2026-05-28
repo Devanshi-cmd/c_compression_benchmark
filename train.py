@@ -358,14 +358,17 @@ def train_model(model_id: int):
     n_params = model.count_parameters()
     print(f"Parameters  : {n_params:,}")
 
-    # torch.compile (RTX 5090 optimization)
-    if device.type == 'cuda':
+    # torch.compile — disabled by default (RTX 5090 / Blackwell sm_120 not
+    # supported by pre-built PyTorch kernels). Set TORCH_COMPILE=1 to enable.
+    if device.type == 'cuda' and os.environ.get('TORCH_COMPILE', '0') == '1':
         print("Compiling model with torch.compile()...")
         try:
             model = torch.compile(model, mode='reduce-overhead')
             print("torch.compile() applied successfully.")
         except Exception as e:
             print(f"torch.compile() skipped: {e}")
+    else:
+        print("torch.compile() disabled (set TORCH_COMPILE=1 to enable).")
 
     # Optimizer
     optimizer = torch.optim.AdamW(
