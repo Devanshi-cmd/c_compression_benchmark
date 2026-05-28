@@ -31,5 +31,6 @@ jobs:
           tags: |
             devanshitiwari04/c_compression_benchmark:latest
             devanshitiwari04/c_compression_benchmark:v1
+            devanshitiwari04/c_compression_benchmark:v2
           cache-from: type=gha
           cache-to: type=gha,mode=max
